@@ -1,0 +1,347 @@
+const MSEC_PER_SYSTICK: nat16 = 10                      // Elapsed milliseconds per sys tick.
+
+// All values in milliseconds.
+const DCF77_SYNC_LEN: nat16 = 1200 / MSEC_PER_SYSTICK   // Minimum length of synchronization time mark.
+const DCF77_LOW_MIN: nat16 = 80 / MSEC_PER_SYSTICK      // Minimum length of binary zero.
+const DCF77_LOW_MAX: nat16 = 120 / MSEC_PER_SYSTICK     // Maximum length of binary zero.
+const DCF77_HIGH_MIN: nat16 = 180 / MSEC_PER_SYSTICK    // Minimum length of binary one.
+const DCF77_HIGH_MAX: nat16 = 220 / MSEC_PER_SYSTICK    // Maximum length of binary one.
+
+// At least 'n' consecutive bits have to be successfully received until
+// the DCF77 signal is considered stable. 
+const DCF77_NUM_BITS_STABLE: nat8 = 3
+
+// The states of the four color LEDs.
+struct LedStates
+    var green: bool
+    var red: bool
+    var orange: bool
+    var blue: bool
+end
+
+// The decoded time information.
+struct TimeInfo
+    var second: nat8 = 0       // 00 - 59
+    var minute: nat8 = 0       // 00 - 59
+    var hour: nat8 = 0         // 00 - 23
+    var day_of_month: nat8 = 0 // 01 - 31
+    var month: nat8 = 0        // 01 - 12
+    var year: nat8 = 0         // 00 - 99 (within century)
+    var day_of_week: nat8 = 0  // 01 - 07 (Monday = 1, Sunday = 7)
+end
+
+// Turns off all LEDs.
+// @param[out] leds The states of the LEDs.
+function ledsAllOn () (leds: LedStates)
+    leds.orange = true
+    leds.green = true
+    leds.red = true
+    leds.blue = true
+end
+
+// Turns off all LEDs.
+// @param[out] leds The states of the LEDs.
+function ledsAllOff () (leds: LedStates)
+    leds.orange = false
+    leds.green = false
+    leds.red = false
+    leds.blue = false
+end
+
+// Performs a simple plausibility check based on two consecutive time infos
+// 't1' and 't2' in order to validate 't2'.
+// @param[in] t1 The first time info.
+// @param[in] t2 The second (consecutive) time info.
+// @return true, if 't2' is valid, else false.
+function isTimeInfoValid (t1: TimeInfo, t2: TimeInfo) returns bool
+    var is_valid: bool = false
+    //
+    // No hour overflow.
+    // (Both time infos belong to the same hour.)
+    //
+    if t1.hour == t2.hour and t1.minute + 1 == t2.minute then
+        is_valid = true // Okay.
+    //
+    // Hour overflow.
+    // (The time infos belong to two consecutive hours.)
+    //
+    elseif t1.hour + 1 == t2.hour and t1.minute == 59 and t2.minute == 0 then
+        is_valid = true // Okay.
+    //
+    // Day overflow.
+    // (The time infos belong to the last hour of the old day and the first hour of the new day.)
+    //
+    elseif t1.hour == 23 and t2.hour == 0 and t1.minute == 59 and t2.minute == 0 then
+        is_valid = true // Okay.
+    end
+    
+    return is_valid
+end
+
+function processBit (i: nat8, bit: nat8) (parity: nat8, ti: TimeInfo) returns bool
+    let inc: [8]nat8 = {1, 2, 4, 8, 10, 20, 40, 80}
+    //
+    // Bit 0: Start of minute, always 0.
+    //
+    if i == 0 and bit != 0 then
+        return false
+    //
+    // Bit 20: Start of time information, always 1.
+    //
+    elseif i == 20 and bit != 1 then
+        return false
+    //
+    // MINUTE
+    //
+    elseif i >= 21 and i <= 27 and bit == 1 then
+        ti.minute = ti.minute + inc[i - 21]
+        parity = parity + 1
+    //
+    // PARITY 1
+    //
+    elseif i == 28 then
+        if bit == parity % 2 then
+            parity = 0 // okay
+        else
+            return false
+        end
+    //
+    // HOUR
+    //
+    elseif i >= 29 and i <= 34 and bit == 1 then
+        ti.hour = ti.hour + inc[i - 29]
+        parity = parity + 1
+    //
+    // PARITY 2
+    //
+    elseif i == 35 then
+        if bit == parity % 2 then
+            parity = 0 // okay
+        else
+            return false
+        end
+    //
+    // DAY OF MONTH
+    //
+    elseif i >= 36 and i <= 41 and bit == 1 then
+        ti.day_of_month = ti.day_of_month + inc[i - 36]
+        parity = parity + 1
+    //
+    // DAY OF WEEK
+    //
+    elseif i >= 42 and i <= 44 and bit == 1 then
+        ti.day_of_week = ti.day_of_week + inc[i - 42]
+        parity = parity + 1
+    //
+    // MONTH
+    //
+    elseif i >= 45 and i <= 49 and bit == 1 then
+        ti.month = ti.month + inc[i - 45]
+        parity = parity + 1
+    //
+    // YEAR
+    //
+    elseif i >= 50 and i <= 57 and bit == 1 then
+        ti.year = ti.year + inc[i - 50]
+        parity = parity + 1
+    //
+    // PARITY 3
+    //
+    elseif i == 58 then
+        if bit == parity % 2 then
+            parity = 0 // okay
+        else
+            return false
+        end
+    else
+        // ignore
+    end
+
+    return true
+end
+
+// Visualizes the current DCF77 signal level using the provided LED.
+// @param[in] dcf77 The DCF77 level.
+// @param[out] ledDcf77 The state of the LED used to visualize the level.
+activity Visualize (dcf77: bool) (ledDcf77: bool)
+    repeat
+        await dcf77         // Await rising edge.
+        ledDcf77 = false    // Turn off LED.
+        await not dcf77     // Await falling edge.
+        ledDcf77 = true     // Turn on LED.
+    end
+end
+
+// Captures the next synchronization time mark.
+// @param[in] dcf77 The DCF77 level.
+activity CaptureSync (dcf77: bool)
+    // Perform the measurement and restart if the level drops meanwhile.
+    when not dcf77 reset
+        var len: nat16 = 0
+        repeat
+            await true // Await next sys tick.
+            len = len + 1
+        until len > DCF77_SYNC_LEN end
+    end
+end
+
+// Captures the next second mark and decodes its binary value.
+// @param[in] dcf77 The DCF77 level.
+// @param[out] bit The decoded binary value.
+// @return true on success, else false.
+activity CaptureBit (dcf77: bool) (bit: nat8) returns bool
+    //
+    // Await idle level ('HIGH').
+    //
+    if not dcf77 then
+        await dcf77
+    end
+    //
+    // Await falling edge.
+    //
+    await not dcf77
+    //
+    // Measure low level.
+    //
+    var len: nat16 = 0
+    repeat
+        await true
+        len = len + 1
+    until dcf77 end
+    //
+    // Determine bit value.
+    //
+    if (len >= DCF77_LOW_MIN and len <= DCF77_LOW_MAX) then
+        bit = 0 // Binary zero.
+    elseif (len >= DCF77_HIGH_MIN and len <= DCF77_HIGH_MAX) then
+        bit = 1 // Binary one.
+    else
+        return false // Invalid value.
+    end
+
+    return true
+end
+
+// Captures and decodes the time information of one minute.
+// @param[in] dcf77 The DCF77 level.
+// @param[out] ti The decoded time info.
+// @param[out] ledSync The state of the LED used for indicating the synchronization time mark capture.
+// @return true on success, else false.
+activity CaptureTimeInfo (dcf77: bool)(ti: TimeInfo, ledSync: bool) returns bool
+    //
+    // Capture synchronization time mark.
+    //
+    ledSync = false // Turn off LED.
+    run CaptureSync(dcf77)
+    ledSync = true  // Turn on LED.
+    //
+    // Capture time information.
+    //
+    var success: bool = true
+    var parity: nat8 = 0
+    var i: nat8 = 0
+    
+    while success and (i <= 58) repeat
+        //
+        // Capture next bit.
+        //
+        var bit: nat8
+        success = run CaptureBit(dcf77)(bit)
+        
+        if success then
+            success = processBit(i, bit)(parity, ti)
+        end
+
+        i = i + 1
+    end
+
+    ledSync = false // Turn off LED.
+
+    return success
+end
+
+// Retrieves and decodes the time information from DCF77.
+// @param[in] dcf77 See Main activity.
+// @param[out] ti The decoded time information.
+// @param[out] ledSync The state of the LED used for indicating the synchronization time mark capture.
+// @return true on success, else false.
+activity Decode (dcf77: bool) (ti: TimeInfo, ledSync: bool) returns bool
+    var success: bool
+    var tmp: TimeInfo
+    //
+    // Perform 1st time info capture.
+    //
+    success = run CaptureTimeInfo(dcf77)(tmp, ledSync)
+
+    if not success then
+        return false
+    end
+    //
+    // Perform 2nd (consecutive) time info capture.
+    //
+    success = run CaptureTimeInfo(dcf77)(ti, ledSync)
+
+    if not success then
+        return false
+    end
+
+    return isTimeInfoValid(tmp, ti) // Check plausibility.
+end
+
+activity AwaitStableSignal (dcf77: bool)
+    var success: bool
+    when not success reset
+        success = true
+        var cnt: nat8 = 0
+        repeat
+            var bit: nat8
+            success = run CaptureBit(dcf77)(bit)
+            cnt = cnt + 1
+        until cnt >= DCF77_NUM_BITS_STABLE end
+    end
+end
+
+// The entry point of the Blech application part.
+// @param[in] dcf77 The DCF77 signal level (true = 'HIGH').
+// @param[in] btn The user button state (true = 'PRESSED').
+// @param[out] leds The LED states (true = 'ON').
+@[EntryPoint]
+activity Main (dcf77: bool, btn: bool) (leds: LedStates)
+    ledsAllOn()(leds)
+    // When the system is powered-up the receiver module needs some time to stabilize
+    // its oszillators and supply voltages. Thus, the DCF77 signal is not immediately
+    // stable after system boot. For this reason, it is reasonable to await a stable
+    // signal before starting the decoding process.
+    run AwaitStableSignal(dcf77)
+
+    repeat
+        ledsAllOff()(leds)      // Turn off all LEDs.
+    
+        var ti: TimeInfo        // The decoded time information.
+        var success: bool
+
+        cobegin
+            //
+            // Retrieve the time information from the DCF77 signal.
+            // Use the orange LED to indicate the capture of the synchronization mark.
+            //
+            success = run Decode(dcf77)(ti, leds.orange)
+        with weak
+            //
+            // Concurrently, visualize the current DCF77 level using the blue LED.
+            //
+            run Visualize(dcf77)(leds.blue)
+        end
+
+        ledsAllOff()(leds)      // Turn off all LEDs.
+
+        if success then
+            leds.green = true   // Decode() succeeded -> green LED on.
+            // ... use 'ti' for synchronizing the local clock ...
+        else
+            leds.red = true     // Decode() failed -> red LED on.
+        end
+
+        await btn               // Await user button press.
+    end
+end
